@@ -24,6 +24,10 @@ module.exports = {
       autorestart: true,
       max_restarts: 10,
       restart_delay: 2000,
+      // Safety net: restart every 6h so the in-memory connection counter can
+      // never drift up to the global cap and 429 everyone. The real fix is the
+      // idle-socket reaper in proxyServer.ts; this is belt-and-suspenders.
+      cron_restart: "0 */6 * * *",
     },
   ],
 };

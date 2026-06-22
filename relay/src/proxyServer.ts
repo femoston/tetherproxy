@@ -20,12 +20,23 @@ export interface TunnelLike {
   waitOpen(streamId: number): Promise<{ ok: boolean; reason?: string }>;
 }
 
+// Half-closed / silent client sockets (scanners that connect, never send a
+// full request, and never complete the TCP close) would otherwise sit in
+// FIN-WAIT-2 forever — "close"/"end" never fire, so their limiter slot is never
+// released and `totalActive` leaks up to the global cap, after which the relay
+// 429s everyone. An idle timeout destroys those sockets so the slot is freed.
+// The timer is activity-based, so live CONNECT tunnels that keep streaming are
+// never reaped.
+const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+
 export interface ProxyServerOptions {
   getLiveTunnel: () => TunnelLike | null;
   store: Store;
   allowedClientCidrs: string[];
   /** Optional connection limiter; one is created from defaults if omitted. */
   limiter?: ConnectionLimiter;
+  /** Idle socket timeout (ms) before a stalled connection is reaped. */
+  idleTimeoutMs?: number;
 }
 
 /**
@@ -37,6 +48,7 @@ export interface ProxyDeps {
   store: Store;
   allowedClientCidrs: string[];
   limiter: ConnectionLimiter;
+  idleTimeoutMs: number;
 }
 
 interface ParsedRequest {
@@ -56,6 +68,13 @@ interface ParsedRequest {
  */
 export function handleProxyConnection(sock: Socket, deps: ProxyDeps): void {
   sock.on("error", () => sock.destroy());
+
+  // Reap stalled/half-closed sockets. setTimeout is activity-based (it resets on
+  // read/write), so a live CONNECT tunnel that keeps streaming is never hit, but
+  // a scanner that connects and goes silent — or a peer that never completes its
+  // FIN — is destroyed, which fires "close" and releases its limiter slot.
+  sock.setTimeout(deps.idleTimeoutMs);
+  sock.on("timeout", () => sock.destroy());
 
   // IP allowlist (CIDR) check before anything else.
   const ip = (sock.remoteAddress ?? "").replace(/^::ffff:/, "");
@@ -126,6 +145,7 @@ export class ProxyServer {
       store: opts.store,
       allowedClientCidrs: opts.allowedClientCidrs,
       limiter: opts.limiter ?? new ConnectionLimiter(),
+      idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
     };
     this.server = createServer((sock) => handleProxyConnection(sock, this.deps));
   }

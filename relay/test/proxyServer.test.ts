@@ -91,12 +91,14 @@ async function startProxy(opts: {
   tunnel: TunnelLike | null;
   store: Store;
   limiter?: ConnectionLimiter;
+  idleTimeoutMs?: number;
 }): Promise<number> {
   proxy = new ProxyServer({
     getLiveTunnel: () => opts.tunnel,
     store: opts.store,
     allowedClientCidrs: [],
     limiter: opts.limiter,
+    idleTimeoutMs: opts.idleTimeoutMs,
   });
   const port = await proxy.listen(0);
   return port;
@@ -301,6 +303,55 @@ describe("ipAllowed CIDR matching", () => {
     expect(ipAllowed("1.2.3.4", ["1.2.3.4/32"])).toBe(true);
     expect(ipAllowed("1.2.3.5", ["1.2.3.4/32"])).toBe(false);
   });
+});
+
+describe("ProxyServer idle-connection reaping (slot-leak guard)", () => {
+  it(
+    "reaps an idle client that never completes its request so the limiter slot is released",
+    { timeout: 2000 },
+    async () => {
+      store = new Store(":memory:");
+      await seedUser(store, "alice", "pw");
+      const tunnel = new FakeTunnel();
+      // maxPerIp = 1 so a single leaked slot blocks the IP; a short idle timeout
+      // makes the reaper fire quickly under test.
+      const limiter = new ConnectionLimiter({
+        maxTotal: 100,
+        maxPerIp: 1,
+        maxNewPerMin: 100,
+        windowMs: 60000,
+      });
+      const port = await startProxy({
+        tunnel,
+        store,
+        limiter,
+        idleTimeoutMs: 100,
+      });
+
+      // A scanner-like client: opens a socket (acquiring the slot) but sends
+      // nothing and never closes. This is exactly what leaks slots in prod —
+      // the socket sits half-open and "close"/"end" never fire.
+      const idle = rawConnect(port);
+      await once(idle, "connect");
+
+      // The relay must reap the idle socket; "close" fires on the client once it
+      // does. Without the reaper this never happens and the test times out.
+      await once(idle, "close");
+
+      // Slot released: a fresh connection from the same IP is now admitted.
+      const next = rawConnect(port);
+      await once(next, "connect");
+      next.write(
+        `CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: ${basicHeader(
+          "alice",
+          "pw",
+        )}\r\n\r\n`,
+      );
+      expect(await readResponseHead(next)).toContain(
+        "200 Connection Established",
+      );
+    },
+  );
 });
 
 describe("ProxyServer connection limiter", () => {
