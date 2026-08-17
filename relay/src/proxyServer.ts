@@ -1,4 +1,9 @@
-import { createServer, type Server, type Socket } from "node:net";
+import {
+  createServer,
+  connect as netConnect,
+  type Server,
+  type Socket,
+} from "node:net";
 import { Store } from "./store.js";
 import {
   parseProxyAuthorization,
@@ -37,6 +42,10 @@ export interface ProxyServerOptions {
   limiter?: ConnectionLimiter;
   /** Idle socket timeout (ms) before a stalled connection is reaped. */
   idleTimeoutMs?: number;
+  /** Serve requests via the relay's own egress when the phone tunnel is down. */
+  directFallback?: boolean;
+  /** Domain suffixes eligible for direct fallback (empty = all targets). */
+  directAllow?: string[];
 }
 
 /**
@@ -49,6 +58,8 @@ export interface ProxyDeps {
   allowedClientCidrs: string[];
   limiter: ConnectionLimiter;
   idleTimeoutMs: number;
+  directFallback: boolean;
+  directAllow: string[];
 }
 
 interface ParsedRequest {
@@ -146,6 +157,8 @@ export class ProxyServer {
       allowedClientCidrs: opts.allowedClientCidrs,
       limiter: opts.limiter ?? new ConnectionLimiter(),
       idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+      directFallback: opts.directFallback ?? false,
+      directAllow: opts.directAllow ?? [],
     };
     this.server = createServer((sock) => handleProxyConnection(sock, this.deps));
   }
@@ -184,9 +197,18 @@ async function handleRequest(
     return;
   }
 
-  // 2. Find a live phone tunnel.
+  // 2. Find a live phone tunnel. When it's down (the phone egress drops
+  // silently and often — see 2026-07/08 flagship outages) optionally degrade
+  // to the relay's own egress instead of 503ing every client.
   const tunnel = deps.getLiveTunnel();
   if (!tunnel) {
+    if (directEligible(deps, req)) {
+      console.log(
+        `[relay] proxy: no live tunnel — direct-egress fallback for ${req.target}`,
+      );
+      handleDirect(sock, req);
+      return;
+    }
     sock.end(
       "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
@@ -194,16 +216,83 @@ async function handleRequest(
   }
 
   if (req.method === "CONNECT") {
-    await handleConnect(sock, req, tunnel);
+    await handleConnect(sock, req, tunnel, deps);
   } else {
-    await handleAbsoluteHttp(sock, req, tunnel);
+    await handleAbsoluteHttp(sock, req, tunnel, deps);
   }
+}
+
+/** Target host of a proxy request (CONNECT host:port or absolute-form URI). */
+function requestHost(req: ParsedRequest): string | null {
+  if (req.method === "CONNECT") {
+    return parseHostPort(req.target, 443)?.host ?? null;
+  }
+  const m = /^https?:\/\/([^/]+)(\/.*)?$/i.exec(req.target);
+  return m ? (parseHostPort(m[1], 80)?.host ?? null) : null;
+}
+
+function directEligible(deps: ProxyDeps, req: ParsedRequest): boolean {
+  if (!deps.directFallback) return false;
+  const host = requestHost(req);
+  if (!host) return false;
+  if (deps.directAllow.length === 0) return true;
+  const h = host.toLowerCase();
+  return deps.directAllow.some((s) => h === s || h.endsWith("." + s));
+}
+
+/** Serve a proxy request via the relay's own egress (no phone tunnel). */
+function handleDirect(sock: Socket, req: ParsedRequest): void {
+  if (req.method === "CONNECT") {
+    const target = parseHostPort(req.target, 443);
+    if (!target) {
+      sock.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    const upstream = netConnect(target.port, target.host, () => {
+      sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      // Bytes the client optimistically sent after the CONNECT header.
+      const early = req.raw.subarray(req.headerEnd + 4);
+      if (early.length > 0) upstream.write(early);
+      sock.pipe(upstream);
+      upstream.pipe(sock);
+    });
+    wireDirectPair(sock, upstream);
+    return;
+  }
+
+  const m = /^https?:\/\/([^/]+)(\/.*)?$/i.exec(req.target);
+  const target = m ? parseHostPort(m[1], 80) : null;
+  if (!target) {
+    sock.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  const path = (m && m[2]) || "/";
+  const upstream = netConnect(target.port, target.host, () => {
+    upstream.write(rebuildOriginForm(req, path));
+    sock.pipe(upstream);
+    upstream.pipe(sock);
+  });
+  wireDirectPair(sock, upstream);
+}
+
+/** Tie the lifetimes of the client socket and the direct upstream together. */
+function wireDirectPair(sock: Socket, upstream: Socket): void {
+  upstream.on("error", () => {
+    if (!sock.writableEnded) {
+      sock.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    }
+    upstream.destroy();
+  });
+  upstream.on("close", () => sock.destroy());
+  sock.on("close", () => upstream.destroy());
+  sock.on("error", () => upstream.destroy());
 }
 
 async function handleConnect(
   sock: Socket,
   req: ParsedRequest,
   tunnel: TunnelLike,
+  deps: ProxyDeps,
 ): Promise<void> {
   const target = parseHostPort(req.target, 443);
   if (!target) {
@@ -221,6 +310,15 @@ async function handleConnect(
   const result = await waiter;
   if (!result.ok) {
     tunnel.mux.delete(streamId);
+    // The tunnel exists but couldn't open the stream (phone flapping /
+    // half-dead). Same degraded path as no-tunnel: try direct egress.
+    if (directEligible(deps, req)) {
+      console.log(
+        `[relay] proxy: tunnel OPEN failed — direct-egress fallback for ${req.target}`,
+      );
+      handleDirect(sock, req);
+      return;
+    }
     sock.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
     return;
   }
@@ -232,6 +330,7 @@ async function handleAbsoluteHttp(
   sock: Socket,
   req: ParsedRequest,
   tunnel: TunnelLike,
+  deps: ProxyDeps,
 ): Promise<void> {
   // Absolute-form request target: METHOD http://host[:port]/path HTTP/1.1
   const m = /^https?:\/\/([^/]+)(\/.*)?$/i.exec(req.target);
@@ -257,6 +356,13 @@ async function handleAbsoluteHttp(
   const result = await waiter;
   if (!result.ok) {
     tunnel.mux.delete(streamId);
+    if (directEligible(deps, req)) {
+      console.log(
+        `[relay] proxy: tunnel OPEN failed — direct-egress fallback for ${req.target}`,
+      );
+      handleDirect(sock, req);
+      return;
+    }
     sock.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
     return;
   }

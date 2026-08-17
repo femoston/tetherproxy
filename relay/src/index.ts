@@ -46,6 +46,8 @@ export function createRelay(config: Config): Relay {
     store,
     allowedClientCidrs: config.allowedClientCidrs,
     limiter,
+    directFallback: config.directFallback,
+    directAllow: config.directAllow,
   });
 
   // Optional TLS proxy listener (HTTPS_PROXY=https://...). Reuses the relay's
@@ -77,6 +79,13 @@ export function createRelay(config: Config): Relay {
       }
 
       console.log(`[relay] proxy listening on :${proxyPort}`);
+      console.log(
+        config.directFallback
+          ? `[relay] direct-egress fallback: ENABLED (allow: ${
+              config.directAllow.length ? config.directAllow.join(",") : "all"
+            })`
+          : `[relay] direct-egress fallback: disabled`,
+      );
       if (proxyTlsPort !== undefined) {
         console.log(`[relay] TLS proxy listening on :${proxyTlsPort}`);
       }

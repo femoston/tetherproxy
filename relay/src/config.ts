@@ -18,6 +18,17 @@ export interface Config {
   rateLimit: RateLimitConfig;
   /** Public IP/host of the relay; used only to print the app pairing string. */
   publicHost: string | undefined;
+  /**
+   * When the phone tunnel is down, serve proxy requests via the relay's own
+   * egress instead of failing with 503/502. Off by default: the phone's
+   * residential IP is the product; direct egress is a degraded emergency mode.
+   */
+  directFallback: boolean;
+  /**
+   * Domain suffixes allowed for direct-egress fallback (exact host or any
+   * subdomain). Empty list = allow all targets, same as the phone tunnel.
+   */
+  directAllow: string[];
 }
 
 function parsePort(raw: string | undefined, name: string, def: number): number {
@@ -71,6 +82,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
 
+  const directFallback =
+    env.DIRECT_FALLBACK === "1" || env.DIRECT_FALLBACK === "true";
+  // "*" opts into allow-all; unset keeps the Instagram-only default so a
+  // leaked credential can't turn the relay into a general open proxy.
+  const directAllowRaw = env.DIRECT_ALLOW ?? "";
+  const directAllow =
+    directAllowRaw.trim() === "*"
+      ? []
+      : directAllowRaw
+          .split(",")
+          .map((s) => s.trim().toLowerCase())
+          .filter((s) => s.length > 0);
+  if (directAllowRaw.trim() === "" ) {
+    directAllow.push("instagram.com", "cdninstagram.com", "fbcdn.net");
+  }
+
   return {
     pairingToken,
     proxyPort: parsePort(env.PROXY_PORT, "PROXY_PORT", 8080),
@@ -82,6 +109,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     tlsCertPath: env.TLS_CERT_PATH || `${certDir}/tunnel-cert.pem`,
     tlsKeyPath: env.TLS_KEY_PATH || `${certDir}/tunnel-key.pem`,
     publicHost: env.RELAY_PUBLIC_HOST || undefined,
+    directFallback,
+    directAllow,
     rateLimit: {
       maxTotal: parsePositiveInt(
         env.RATE_LIMIT_MAX_TOTAL,

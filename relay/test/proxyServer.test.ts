@@ -92,6 +92,8 @@ async function startProxy(opts: {
   store: Store;
   limiter?: ConnectionLimiter;
   idleTimeoutMs?: number;
+  directFallback?: boolean;
+  directAllow?: string[];
 }): Promise<number> {
   proxy = new ProxyServer({
     getLiveTunnel: () => opts.tunnel,
@@ -99,6 +101,8 @@ async function startProxy(opts: {
     allowedClientCidrs: [],
     limiter: opts.limiter,
     idleTimeoutMs: opts.idleTimeoutMs,
+    directFallback: opts.directFallback,
+    directAllow: opts.directAllow,
   });
   const port = await proxy.listen(0);
   return port;
@@ -166,6 +170,93 @@ describe("ProxyServer no live phone", () => {
     );
     const head = await readResponseHead(s);
     expect(head).toContain("503 Service Unavailable");
+  });
+});
+
+describe("ProxyServer direct-egress fallback", () => {
+  it("CONNECTs via the relay's own egress when no tunnel is live", async () => {
+    store = new Store(":memory:");
+    await seedUser(store, "alice", "pw");
+    // Local "origin" the fallback should reach directly.
+    const origin = (await import("node:net")).createServer((c) => {
+      c.on("data", (d) => c.write(Buffer.concat([Buffer.from("echo:"), d])));
+    });
+    await new Promise<void>((r) => origin.listen(0, "127.0.0.1", () => r()));
+    const originPort = (origin.address() as AddressInfo).port;
+    try {
+      const port = await startProxy({
+        tunnel: null,
+        store,
+        directFallback: true,
+        directAllow: ["127.0.0.1"],
+      });
+      const s = rawConnect(port);
+      await once(s, "connect");
+      s.write(
+        `CONNECT 127.0.0.1:${originPort} HTTP/1.1\r\nHost: 127.0.0.1:${originPort}\r\nProxy-Authorization: ${basicHeader(
+          "alice",
+          "pw",
+        )}\r\n\r\n`,
+      );
+      const head = await readResponseHead(s);
+      expect(head).toContain("200 Connection Established");
+      const reply = new Promise<string>((resolve) => {
+        s.once("data", (d: Buffer) => resolve(d.toString("utf8")));
+      });
+      s.write("hello");
+      expect(await reply).toBe("echo:hello");
+    } finally {
+      origin.close();
+    }
+  });
+
+  it("still 503s when the target host is outside the allowlist", async () => {
+    store = new Store(":memory:");
+    await seedUser(store, "alice", "pw");
+    const port = await startProxy({
+      tunnel: null,
+      store,
+      directFallback: true,
+      directAllow: ["instagram.com"],
+    });
+    const s = rawConnect(port);
+    await once(s, "connect");
+    s.write(
+      `CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\nProxy-Authorization: ${basicHeader(
+        "alice",
+        "pw",
+      )}\r\n\r\n`,
+    );
+    const head = await readResponseHead(s);
+    expect(head).toContain("503 Service Unavailable");
+  });
+
+  it("allows subdomains of an allowlisted suffix", async () => {
+    store = new Store(":memory:");
+    await seedUser(store, "alice", "pw");
+    // Suffix instagram.com must match i.instagram.com but not notinstagram.com.
+    const origin = (await import("node:net")).createServer(() => {});
+    await new Promise<void>((r) => origin.listen(0, "127.0.0.1", () => r()));
+    try {
+      const port = await startProxy({
+        tunnel: null,
+        store,
+        directFallback: true,
+        directAllow: ["instagram.com"],
+      });
+      const s = rawConnect(port);
+      await once(s, "connect");
+      s.write(
+        `CONNECT notinstagram.com:443 HTTP/1.1\r\nHost: notinstagram.com:443\r\nProxy-Authorization: ${basicHeader(
+          "alice",
+          "pw",
+        )}\r\n\r\n`,
+      );
+      const head = await readResponseHead(s);
+      expect(head).toContain("503 Service Unavailable");
+    } finally {
+      origin.close();
+    }
   });
 });
 
