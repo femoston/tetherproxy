@@ -5,9 +5,14 @@ services:
     container_name: tetherproxy-relay
     restart: unless-stopped
     env_file: .env
+
     ports:
       - "31742:31742"
       - "48193:48193"
+
+    networks:
+      - dokploy-network
+
     volumes:
       - relay-data:/data
       - relay-certs:/certs
@@ -15,3 +20,7 @@ services:
 volumes:
   relay-data:
   relay-certs:
+
+networks:
+  dokploy-network:
+    external: true
