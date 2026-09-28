@@ -5,10 +5,9 @@ services:
     container_name: tetherproxy-relay
     restart: unless-stopped
     env_file: .env
-    expose:
-      - "31742"
-      - "48193"
-      # - "8081:8081" # optional TLS proxy (uncomment with PROXY_TLS_PORT)
+    ports:
+      - "31742:31742"
+      - "48193:48193"
     volumes:
       - relay-data:/data
       - relay-certs:/certs
